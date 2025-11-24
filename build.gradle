@@ -26,6 +26,7 @@ dependencies {
     
     // Database
     runtimeOnly 'com.h2database:h2'
+    runtimeOnly 'org.postgresql:postgresql:42.7.4'
     
     // HTTP Client
     implementation 'org.springframework.boot:spring-boot-starter-webflux'

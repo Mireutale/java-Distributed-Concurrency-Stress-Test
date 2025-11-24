@@ -14,13 +14,27 @@ import org.springframework.context.annotation.Bean;
 @SpringBootApplication
 @RequiredArgsConstructor
 public class Application {
+    /**
+     * 강좌 데이터 초기화 및 조회/저장을 담당하는 저장소
+     */
     private final CourseRepository courseRepository;
+    /**
+     * 서버 풀 초기화와 요청 분산을 담당하는 로드밸런서
+     */
     private final LoadBalancer loadBalancer;
     
+    /**
+     * 스프링 부트 애플리케이션 진입점
+     *
+     * @param args 실행 인자
+     */
     public static void main(String[] args) {
         SpringApplication.run(Application.class, args);
     }
     
+    /**
+     * 애플리케이션 기동 시 초기 서버 풀 구성과 예시 강좌 데이터를 생성
+     */
     @Bean
     public CommandLineRunner initData() {
         return args -> {
@@ -29,19 +43,13 @@ public class Application {
             
             // 초기 데이터 생성
             if (courseRepository.count() == 0) {
-                Course course1 = new Course();
-                course1.setName("Java Programming");
-                course1.setCapacity(100);
+                Course course1 = new Course("Java Programming", 100);
                 courseRepository.save(course1);
                 
-                Course course2 = new Course();
-                course2.setName("Spring Boot");
-                course2.setCapacity(50);
+                Course course2 = new Course("Spring Boot", 50);
                 courseRepository.save(course2);
                 
-                Course course3 = new Course();
-                course3.setName("Database Design");
-                course3.setCapacity(30);
+                Course course3 = new Course("Database Design", 30);
                 courseRepository.save(course3);
                 
                 log.info("Initial courses created");
