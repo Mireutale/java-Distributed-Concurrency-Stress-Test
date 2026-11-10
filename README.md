@@ -1,185 +1,176 @@
-# 분산 동시성 스트레스 테스트 시스템
+# 분산 동시성 스트레스 테스트
 
-> 수강신청은 왜 터지는가. 로드밸런서·서버 3대·우선순위 큐를 직접 만들고, k6로 부하를 걸어 한계를 확인한 뒤 **적응형 동시 처리 제어**로 개선한 실험입니다.
+> **수강신청 사이트는 왜 터질까?**
+> 직접 작은 수강신청 시스템을 만들고 요청을 한꺼번에 쏟아부어 어디서 무너지는지 확인한 뒤, 무너지지 않게 고친 실험입니다.
 
 - 2025.11 · 우아한테크코스 8기 프리코스 오픈미션 · 개인 프로젝트
 - Java 21 · Spring Boot 3.2 · Spring Data JPA · WebFlux · PostgreSQL · Docker · k6
 
-## 결과 요약
+## 한눈에 보기
 
-초당 2,000건의 수강신청 요청(k6, 60초, VU 1,000~5,000)을 같은 조건으로 걸었을 때의 결과입니다.
+1초에 2,000명이 동시에 수강신청 버튼을 누르는 상황을 1분 동안 만들었습니다.
 
-| 지표 | 고정 동시 처리 수 | 적응형 동시 처리 제어 |
+| | 고치기 전 | 고친 후 |
 | :--- | :---: | :---: |
-| 실패율 (`http_req_failed`) | 20.79% | **0.00%** |
-| p95 응답 시간 | 11.71s | **462.06ms** |
-| 완료된 요청 수 | 79,447 | **119,112** |
-| 초당 처리량 | 1,221/s | **1,981/s** |
+| 실패한 요청 | 100건 중 약 **21건** | **0건** |
+| 느린 쪽 응답 시간 (p95) | **11.7초** | **0.46초** |
+| 1초에 처리한 요청 | 약 1,200건 | 약 **2,000건** |
 
-## 시스템 아키텍처
+> **p95**: 요청 100개를 빠른 순서로 줄 세웠을 때 95번째 요청의 응답 시간입니다. "대부분의 사용자가 이 시간 안에 응답을 받는다"는 뜻입니다.
 
-```
-[k6 부하 생성기]
-         ↓
-[로드밸런서 (포트 8080)]   ← 라운드로빈 분배 (WebFlux WebClient)
-         ↓
-    ┌────┴────┬────────┐
-    ↓         ↓        ↓
-[서버1]   [서버2]   [서버3]   ← 서버마다 우선순위 큐 + 적응형 동시 처리 제어
-포트8081  포트8082  포트8083
-    ↓         ↓        ↓
-    └────┬────┴────────┘
-         ↓
-   [PostgreSQL]   ← 3대가 공유, 강좌 행에 비관적 락
-```
+**무엇을 고쳤나?** 서버가 한 번에 처리하는 요청 수를 고정해 두지 않고, 서버 상태를 보면서 **스스로 늘렸다 줄였다** 하게 만들었습니다. ([아래에서 자세히](#핵심-서버가-스스로-처리량을-조절하게-만들기))
 
-- **로드밸런서**: `AtomicInteger` 인덱스를 `getAndIncrement() % 서버 수`로 돌려 요청을 서버 3대에 순서대로 나눕니다.
-- **서버 3대**: 같은 코드를 프로필(`server1/2/3`)만 바꿔 띄운 독립 인스턴스입니다.
-- **공유 PostgreSQL**: 서버 3대가 같은 DB를 보기 때문에, 같은 강좌의 남은 자리를 동시에 건드리는 실제 경합이 생깁니다.
+## 용어 정리
 
-## 프로젝트 구조
+| 용어 | 쉬운 설명 |
+| :--- | :--- |
+| 로드밸런서 | 들어온 요청을 여러 서버에 골고루 나눠 주는 안내원 |
+| 큐 (Queue) | 처리를 기다리는 요청들의 대기 줄 |
+| 동시 처리 한도 | 서버가 한 번에 처리하는 요청의 최대 개수 |
+| 락 (Lock) | 한 사람이 데이터를 고치는 동안 다른 사람이 못 건드리게 잠그는 것 |
+| k6 | 가짜 사용자를 대량으로 만들어 요청을 보내는 부하 테스트 도구 |
+| VU (Virtual User) | k6가 만드는 가짜 사용자 한 명 |
+
+## 시스템 구조
 
 ```
-src/main/java/com/stresstest/
-├── loadbalancer/       # 로드밸런서 (LoadBalancer, LoadBalancerController)
-├── controller/         # 서버 REST API (ServerController)
-├── service/            # 신청 처리 (EnrollmentService, EnrollmentProcessor)
-├── queue/              # 우선순위 큐 + 적응형 제어 (PriorityEnrollmentQueue)
-├── repository/         # JPA 리포지토리 (비관적 락 쿼리 포함)
-├── model/              # 도메인 모델 (Course, Enrollment, EnrollmentRequest)
-└── Application.java
-
-src/main/resources/     # 공통 설정 + 프로필별 설정 (lb, server1~3)
-k6/                     # 부하 테스트 스크립트 (enroll-spike.js, courses-baseline.js)
+        [k6: 가짜 사용자 수천 명]
+                   │
+                   ▼
+        [로드밸런서 :8080]        요청을 서버 1 → 2 → 3 → 1 … 순서로 나눠 줌
+           ┌───────┼───────┐
+           ▼       ▼       ▼
+       [서버1]  [서버2]  [서버3]   서버마다 대기 줄(큐)과 동시 처리 한도가 있음
+        :8081    :8082    :8083
+           └───────┼───────┘
+                   ▼
+            [PostgreSQL DB]       서버 3대가 DB 하나를 같이 씀
 ```
 
-## 요청 처리 흐름
+**왜 서버 3대가 DB 하나를 같이 쓰나요?**
+실제 수강신청처럼 여러 서버가 **같은 강의의 남은 자리를 동시에 건드리는 상황**을 만들기 위해서입니다. 서버마다 DB가 따로 있으면 이런 충돌이 생기지 않아 실험이 의미가 없습니다.
+
+## 수강신청 요청 하나가 처리되는 과정
 
 ```
-POST /lb/enroll
-  → 로드밸런서가 서버 하나를 골라 POST /api/enroll 전달
-  → 서버는 요청을 우선순위 큐에 넣고 바로 200 "queued" 응답 (비동기 처리)
-  → processQueue()
-      ├─ pollRequest(): 처리 중인 수 ≥ 동시 처리 한도이면 꺼내지 않고 대기
-      └─ 한도 안이면 꺼내서 처리 (처리 중 +1)
-          → EnrollmentProcessor.processEnrollment()  ← 트랜잭션 + 비관적 락
-          → finally: onProcessed(걸린 시간, 성공 여부)  ← 동시 처리 한도 조절
-                     releaseSlot()                      ← 처리 중 -1
-                     큐가 남아 있으면 다음 processQueue() 실행
+① 사용자가 수강신청 → 로드밸런서가 서버 하나를 골라 전달
+② 서버는 요청을 대기 줄에 세우고, 사용자에게 바로 "접수됨" 응답
+③ 서버는 한도 안에서 줄 앞의 요청부터 꺼내 처리
+   ├─ 이미 신청했나? → 거절
+   ├─ 강의 정보를 잠그고(락) 남은 자리 확인 → 꽉 찼으면 거절
+   └─ 자리가 있으면 신청 완료 처리
+④ 처리가 끝나면 걸린 시간과 성공 여부를 보고 한도를 조절
+⑤ 줄에 요청이 남아 있으면 다음 요청 처리
 ```
 
-### 우선순위 큐
+### 대기 줄에도 순서가 있습니다 (우선순위 큐)
 
-- `PriorityBlockingQueue`(초기 용량 10,000)에 `priority` 기준으로 정렬해 넣습니다.
-- `priority` 값이 **낮을수록 먼저** 처리됩니다. (k6에서는 0~99를 무작위로 부여)
+먼저 온 순서가 아니라 **우선순위 숫자가 작은 요청부터** 처리합니다. (테스트에서는 0~99를 무작위로 줬습니다.)
+예를 들어 졸업 예정자를 먼저 받아 주는 것 같은 규칙을 넣을 수 있는 구조입니다.
 
-### DB 동시성 제어 (비관적 락)
+### 정원보다 많이 들어가지 않게 (비관적 락)
 
-`processEnrollment()`는 하나의 `@Transactional` 안에서 아래 순서로 처리합니다. 중간에 하나라도 실패하면 전부 롤백됩니다.
+서버 3대가 동시에 "남은 자리 1개"를 보고 셋 다 신청을 받아 버리면 정원을 넘깁니다.
+이걸 막기 위해, 강의 정보를 읽는 순간 **잠그고**(`PESSIMISTIC_WRITE`) 신청 처리가 끝날 때까지 다른 서버는 기다리게 했습니다.
 
-1. 같은 사용자가 같은 강좌에 이미 신청했는지 확인 → 중복이면 거절
-2. 강좌 행을 `@Lock(PESSIMISTIC_WRITE)`로 조회 → 트랜잭션이 끝날 때까지 다른 서버의 접근 차단
-3. 정원이 찼는지 확인 → 찼으면 거절
-4. 신청 인원 +1, 신청 기록 저장
+신청 확인 → 자리 확인 → 인원 +1 → 기록 저장은 **하나의 묶음(트랜잭션)** 으로 처리해서, 중간에 하나라도 실패하면 전부 없던 일로 되돌립니다.
 
-서버 3대가 동시에 같은 강좌에 접근해도 정원을 넘겨 등록되지 않습니다. 테스트 후 DB를 확인하면 정원 100명 강좌에 정확히 100명만 등록되어 있습니다.
+결과적으로 테스트 후 DB를 보면 **정원 100명 강의에 정확히 100명만** 들어가 있습니다.
 
-## 적응형 동시 처리 제어
+## 핵심: 서버가 스스로 처리량을 조절하게 만들기
 
-### 왜 필요했나
+### 문제: 한도를 몇으로 정해야 할까?
 
-처음에는 서버마다 동시 처리 수를 **고정값**으로 두었습니다.
+처음에는 서버마다 "한 번에 최대 N개 처리"를 **고정값**으로 정해 두었습니다. 그런데 딱 맞는 N을 정하기가 어렵습니다.
 
-- 너무 작으면 서버에 여유가 있어도 큐에서 오래 기다립니다.
-- 너무 크면 DB 락 경합과 스레드가 몰려 응답이 느려지고 실패가 늘어납니다.
+- **너무 작으면** → 서버는 놀고 있는데 사용자는 줄에서 오래 기다림
+- **너무 크면** → DB 잠금 대기가 몰려 모두 느려지고, 결국 실패가 쏟아짐
 
-실제로 큐 용량과 동시 처리 수를 10배로 늘려도 VU 1만 명 조회 테스트의 실패율은 84.47%에서 77.84%로 조금 줄었을 뿐입니다(아래 [부하 테스트 상세](#부하-테스트-상세) 참고). 값을 하나로 정해 두는 대신, **서버 상태를 보고 한도를 스스로 맞추게** 바꿨습니다.
+실제로 한도와 대기 줄 크기를 10배로 늘려 봐도 실패율은 84%에서 78%로 조금 줄었을 뿐이었습니다.
 
-### 동작 원리: AIMD
+### 해결: 상황을 보고 스스로 늘리고 줄이기
 
-TCP 혼잡 제어와 같은 **AIMD**(Additive Increase, Multiplicative Decrease) 방식입니다.
+고속도로 진입로 신호등을 떠올리면 쉽습니다. 도로가 한산하면 차를 더 자주 들여보내고, 막히기 시작하면 진입 간격을 확 늘립니다.
 
-- **잘 되고 있으면 조금씩 늘린다** (+1)
-- **문제가 생기면 크게 줄인다** (×0.7)
+요청 하나가 끝날 때마다 **얼마나 걸렸는지**, **성공했는지**를 보고 한도를 바꿉니다.
 
-요청 하나가 끝날 때마다 `onProcessed(durationMs, success)`가 호출되고, 걸린 시간과 성공 여부로 한도를 조절합니다.
-
-| 상황 | 조건 | 동시 처리 한도 |
+| 상황 | 언제 | 한도 |
 | :--- | :--- | :---: |
-| 빠르게 성공 | 250ms 이내 성공이 50번 쌓임 | **+1** |
-| 큐가 많이 밀림 | 큐에 500건 이상 대기 중이고 성공이 5번 쌓임 | **+1** |
-| 실패 | 처리 실패 1번 | **×0.7** |
-| 너무 느림 | 성공했더라도 500ms(목표의 2배) 초과 | **×0.7** |
+| 😊 잘 되고 있음 | 0.25초 안에 성공한 요청이 50번 쌓이면 | **1 늘림** |
+| 🚶 줄이 너무 김 | 500명 넘게 기다리는 중에 성공이 5번 쌓이면 | **1 늘림** |
+| ❌ 실패 | 요청이 실패하면 바로 | **30% 줄임** |
+| 🐢 너무 느림 | 성공했어도 0.5초를 넘기면 | **30% 줄임** |
 
-- 한도는 **최소 20 ~ 최대 200** 사이에서만 움직이며, 최소값 20에서 시작합니다.
-- 큐가 500건 이상 밀려 있으면 늘리는 조건을 느슨하게 해서, 줄이 길 때 처리량을 더 빨리 끌어올립니다.
-- 줄일 때는 비율로 크게 줄여 과부하에서 빠르게 벗어나고, 늘릴 때는 1씩 조심스럽게 올립니다.
+- 한도는 **20에서 시작**하고, **20 ~ 200** 사이에서만 움직입니다.
+- **늘릴 때는 1씩 조심스럽게, 줄일 때는 30%씩 크게** 줄입니다. 위험할 땐 빨리 물러나고, 괜찮을 땐 천천히 늘리는 방식입니다.
+- 이 방식은 인터넷 통신(TCP)이 회선 혼잡을 피할 때 쓰는 **AIMD**(조금씩 늘리고 크게 줄이기)와 같은 원리입니다.
 
-이렇게 하면 한도가 **서버가 감당할 수 있는 지점 근처에서 자동으로 오르내립니다.**
+이렇게 하면 한도가 **서버가 감당할 수 있는 지점 근처를 스스로 찾아갑니다.**
 
-### 핵심 코드 (`PriorityEnrollmentQueue`)
+### 코드로 보면
+
+[`PriorityEnrollmentQueue.java`](src/main/java/com/stresstest/queue/PriorityEnrollmentQueue.java)의 핵심 부분입니다. (읽기 쉽게 로그 등은 뺐습니다.)
 
 ```java
+// 요청 하나가 끝날 때마다 호출: 걸린 시간(ms)과 성공 여부를 받음
 public void onProcessed(long durationMs, boolean success) {
     if (success) {
-        boolean fastEnough = durationMs <= targetLatencyMs;              // 250ms 이내?
-        int succ = successesSinceIncrease.incrementAndGet();
-        boolean largeBacklog = queue.size() >= backlogBoostThreshold;   // 500건 이상 대기?
+        boolean fastEnough = durationMs <= targetLatencyMs;             // 0.25초 안에 끝났나?
+        int succ = successesSinceIncrease.incrementAndGet();            // 성공 횟수 +1
+        boolean largeBacklog = queue.size() >= backlogBoostThreshold;  // 500명 넘게 기다리나?
         int thresholdForIncrease = Math.max(5, successesForIncrease / (largeBacklog ? 2 : 1));
         if ((fastEnough && succ >= thresholdForIncrease) || (largeBacklog && succ >= 5)) {
             successesSinceIncrease.set(0);
-            maxConcurrentRequests.set(Math.min(maxConcurrent, maxConcurrentRequests.get() + 1)); // +1
+            maxConcurrentRequests.set(Math.min(maxConcurrent, maxConcurrentRequests.get() + 1)); // 한도 +1
         }
     } else {
         successesSinceIncrease.set(0);
-        shrink();                                                        // ×0.7
+        shrink();                                                       // 실패 → 한도 30% 줄임
     }
-    if (durationMs > targetLatencyMs * 2) {                              // 500ms 초과
+    if (durationMs > targetLatencyMs * 2) {                             // 0.5초 넘게 걸림
         successesSinceIncrease.set(0);
-        shrink();
+        shrink();                                                       // 느림 → 한도 30% 줄임
     }
 }
 
 private void shrink() {
     int cur = maxConcurrentRequests.get();
-    maxConcurrentRequests.set(Math.max(minConcurrent, (int) Math.floor(cur * decreaseRatio)));
+    maxConcurrentRequests.set(Math.max(minConcurrent, (int) Math.floor(cur * decreaseRatio))); // ×0.7, 최소 20
 }
 ```
 
-(읽기 쉽게 로그와 EMA 계산 부분을 줄인 코드입니다. 전체 코드는 [`PriorityEnrollmentQueue.java`](src/main/java/com/stresstest/queue/PriorityEnrollmentQueue.java)에 있습니다.)
+<details>
+<summary>설정값 바꾸기</summary>
 
-### 설정값
-
-`@Value`로 주입하며, 따로 지정하지 않으면 아래 기본값을 씁니다.
+설정 파일에 따로 적지 않으면 아래 기본값을 씁니다.
 
 | 설정 키 | 기본값 | 의미 |
 | :--- | :---: | :--- |
-| `queue.adaptive.minConcurrent` | 20 | 동시 처리 한도 최소값 (시작값) |
-| `queue.adaptive.maxConcurrent` | 200 | 동시 처리 한도 최대값 |
-| `queue.adaptive.targetLatencyMs` | 250 | 목표 처리 시간(ms), 2배를 넘으면 축소 |
-| `queue.adaptive.decreaseRatio` | 0.7 | 축소 비율 |
-| `queue.adaptive.successesForIncrease` | 50 | +1 하기 위해 필요한 성공 횟수 |
-| `queue.adaptive.backlogBoostThreshold` | 500 | 큐가 밀렸다고 판단하는 대기 건수 |
+| `queue.adaptive.minConcurrent` | 20 | 한도 최소값 (시작값) |
+| `queue.adaptive.maxConcurrent` | 200 | 한도 최대값 |
+| `queue.adaptive.targetLatencyMs` | 250 | 목표 처리 시간(ms). 2배를 넘으면 한도를 줄임 |
+| `queue.adaptive.decreaseRatio` | 0.7 | 줄일 때 곱하는 비율 |
+| `queue.adaptive.successesForIncrease` | 50 | 한도를 1 늘리는 데 필요한 성공 횟수 |
+| `queue.adaptive.backlogBoostThreshold` | 500 | "줄이 너무 길다"고 보는 대기 인원 |
 
-현재 한도와 상태는 `GET /lb/queue/status`(서버에서는 `GET /api/queue/status`)로 확인할 수 있습니다. 큐 크기, 처리 중인 수, 현재 한도, 처리 시간 지수이동평균(`emaLatencyMs`), 누적 처리 수를 돌려줍니다.
+지금 상태는 `GET /lb/queue/status`로 볼 수 있습니다. 대기 인원, 처리 중인 수, 현재 한도, 평균 처리 시간(`emaLatencyMs`), 누적 처리 수를 알려 줍니다.
 
-### 한계와 개선 방향
+</details>
 
-다시 코드를 보며 정리한, 앞으로 고칠 부분입니다.
+### 아직 아쉬운 점
 
-- **정상적인 거절도 실패로 셉니다.** "정원 초과", "이미 신청함"도 `success=false`라서 한도가 줄어듭니다. 정원이 찬 강좌에 요청이 몰리면 서버에 문제가 없어도 한도가 계속 내려갑니다. 서버 과부하(예외, 타임아웃)와 비즈니스상 거절을 구분해야 합니다.
-- **평균값을 판단에 쓰지 않습니다.** 처리 시간 지수이동평균(`emaLatencyMs`)을 계산하지만 지표 조회에만 쓰고, 판단은 요청 한 건의 처리 시간으로 합니다. 느린 요청 하나에도 한도가 줄어들 수 있어, 평균값 기준으로 판단하면 더 안정적입니다.
-- **한도 확인과 점유가 원자적이지 않습니다.** `pollRequest()`의 "처리 중 수 확인 → 꺼내기 → +1"이 하나로 묶여 있지 않아, 동시에 여러 스레드가 들어오면 한도를 잠깐 넘을 수 있습니다. `Semaphore`나 `compareAndSet`으로 막을 수 있습니다.
-- **k6 응답 시간은 "큐에 넣기"까지의 시간입니다.** `/enroll`은 큐에 넣고 바로 200을 돌려주므로, k6 수치는 실제 DB 처리 완료 시간이 아닙니다. 처리 완료까지의 시간은 서버 로그나 `emaLatencyMs`로 따로 봐야 합니다.
+코드를 다시 보며 찾은, 앞으로 고칠 부분입니다.
 
-## 실행 가이드 (macOS)
+1. **"자리 없음"도 실패로 셉니다.** 정원이 찬 강의에 신청이 몰리면 서버는 멀쩡한데도 한도가 계속 줄어듭니다. 서버가 힘들어서 생긴 실패와 정상적인 거절을 구분해야 합니다.
+2. **요청 하나만 보고 판단합니다.** 평균 처리 시간을 계산해 두고도 판단에는 쓰지 않아서, 느린 요청 하나에도 한도가 줄어듭니다. 평균으로 판단하면 더 안정적입니다.
+3. **한도를 잠깐 넘길 수 있습니다.** "지금 몇 개 처리 중인지 확인 → 꺼내기 → 개수 +1"이 한 번에 묶여 있지 않아서, 여러 요청이 동시에 들어오면 한도를 살짝 넘길 수 있습니다. `Semaphore`로 막을 수 있습니다.
+4. **측정한 응답 시간은 "접수"까지의 시간입니다.** 서버가 줄에 세우자마자 "접수됨"으로 응답하기 때문에, k6가 잰 시간은 실제 신청 완료까지의 시간이 아닙니다.
 
-### 사전 준비
+## 직접 실행해 보기 (macOS)
 
-- Java 21, Gradle, k6 설치
-- Docker Desktop 설치 (PostgreSQL 실행용)
+**준비물**: Java 21, Gradle, k6, Docker Desktop
 
-### 1) PostgreSQL 실행
+**1단계. DB 띄우기**
 
 ```bash
 docker run --name pg-stresstest \
@@ -187,9 +178,9 @@ docker run --name pg-stresstest \
   -p 5432:5432 -d postgres:16
 ```
 
-### 2) 로드밸런서·서버 실행
+**2단계. 로드밸런서와 서버 3대 띄우기**
 
-IntelliJ에서 실행 구성을 4개 만들고, 활성 프로필을 각각 `lb`, `server1`, `server2`, `server3`로 지정해 동시에 실행합니다.
+IntelliJ에서 실행 설정을 4개 만들고, 각각 활성 프로필(Active profiles)을 아래처럼 지정해 동시에 실행합니다.
 
 | 프로필 | 포트 | 역할 |
 | :--- | :---: | :--- |
@@ -198,35 +189,39 @@ IntelliJ에서 실행 구성을 4개 만들고, 활성 프로필을 각각 `lb`,
 | `server2` | 8082 | 서버 2 |
 | `server3` | 8083 | 서버 3 |
 
+잘 떴는지 확인:
+
 ```bash
 curl http://localhost:8080/lb/health
 ```
 
-### 3) 부하 테스트
+**3단계. 부하 걸기**
 
 ```bash
-# 수강신청 부하: 초당 RATE건, DURATION 동안, VU VUS~MAX_VUS
-# 실패가 0이면 RATE와 VUS를 10배씩 올리며 반복
+# 수강신청: 1초에 200건씩 60초 동안 (가짜 사용자 100~500명)
+# 실패가 없으면 RATE와 VUS를 10배씩 올려 가며 반복
 BASE_URL="http://localhost:8080" RATE="200" DURATION="60s" VUS="100" MAX_VUS="500" COURSE_ID="1" k6 run k6/enroll-spike.js
 
-# 강좌 조회 부하
+# 강의 목록 조회: 가짜 사용자 100명이 30초 동안
 BASE_URL="http://localhost:8080" VUS="100" DURATION="30s" k6 run k6/courses-baseline.js
 ```
 
-`enroll-spike.js`는 `constant-arrival-rate`로 초당 요청 수를 고정하고, 성공 기준을 **실패율 1% 미만, p95 500ms 미만**으로 둡니다.
+수강신청 테스트는 **실패율 1% 미만, p95 0.5초 미만**이면 통과로 봅니다.
 
-## 부하 테스트 상세
+## 테스트 결과 자세히
 
-### 수강신청 (`enroll-spike.js`)
+### 수강신청
 
-| 단계 | 조건 | 실패율 | p95 |
-| :--- | :--- | :---: | :---: |
-| 1 | 초당 200건, VU 100~500 | 0.00% | 21.44ms |
-| 2 | 초당 2,000건, VU 1,000~5,000 (고정 한도) | 20.79% | 11.71s |
-| 3 | 초당 2,000건, VU 1,000~5,000 (**적응형 제어**) | **0.00%** | **462.06ms** |
+부하를 10배씩 올리며 한계를 찾고, 무너진 지점에서 적응형 제어를 넣어 다시 측정했습니다.
+
+| 단계 | 조건 | 실패율 | p95 | 결과 |
+| :--- | :--- | :---: | :---: | :---: |
+| 1 | 1초에 200건 | 0% | 0.02초 | ✅ 통과 |
+| 2 | 1초에 2,000건 (고정 한도) | 20.8% | 11.7초 | ❌ 무너짐 |
+| 3 | 1초에 2,000건 (**적응형 제어**) | **0%** | **0.46초** | ✅ 통과 |
 
 <details>
-<summary>1. 초당 200건, VU 100~500</summary>
+<summary>1단계 k6 원본 결과</summary>
 
 ```Text
   █ THRESHOLDS
@@ -250,7 +245,7 @@ BASE_URL="http://localhost:8080" VUS="100" DURATION="30s" k6 run k6/courses-base
 </details>
 
 <details>
-<summary>2. 초당 2,000건, VU 1,000~5,000 (고정 한도)</summary>
+<summary>2단계 k6 원본 결과 (고정 한도)</summary>
 
 ```Text
   █ THRESHOLDS
@@ -276,7 +271,7 @@ BASE_URL="http://localhost:8080" VUS="100" DURATION="30s" k6 run k6/courses-base
 </details>
 
 <details>
-<summary>3. 초당 2,000건, VU 1,000~5,000 (적응형 제어)</summary>
+<summary>3단계 k6 원본 결과 (적응형 제어)</summary>
 
 ```Text
 BASE_URL="http://localhost:8080" RATE="2000" DURATION="60s" VUS="1000" MAX_VUS="5000" COURSE_ID="2" k6 run k6/enroll-spike.js
@@ -334,7 +329,7 @@ BASE_URL="http://localhost:8080" RATE="2000" DURATION="60s" VUS="1000" MAX_VUS="
 </details>
 
 <details>
-<summary>DB 등록 결과 확인 (정원 100명 강좌에 정확히 100명)</summary>
+<summary>DB 확인: 정원 100명 강의에 정확히 100명</summary>
 
 ```Text
 docker exec -it pg-stresstest psql -U app -d stresstest -c "SELECT * FROM courses;"
@@ -348,17 +343,21 @@ docker exec -it pg-stresstest psql -U app -d stresstest -c "SELECT * FROM course
 
 </details>
 
-### 강좌 조회 (`courses-baseline.js`, 성공 기준 p95 300ms 미만)
+### 강의 목록 조회
 
-| 단계 | 조건 | 실패율 | p95 |
-| :--- | :--- | :---: | :---: |
-| 1 | VU 100 | 0.00% | 27.19ms |
-| 2 | VU 1,000 (10배) | 0.00% | 714.1ms |
-| 3 | VU 10,000 (100배) | 84.47% | 29.07s |
-| 4 | VU 10,000, 큐 용량·동시 처리 수 10배 | 77.84% | 25.31s |
+통과 기준: 실패율 1% 미만, p95 0.3초 미만
+
+| 단계 | 가짜 사용자 수 | 실패율 | p95 | 결과 |
+| :--- | :--- | :---: | :---: | :---: |
+| 1 | 100명 | 0% | 0.03초 | ✅ 통과 |
+| 2 | 1,000명 | 0% | 0.71초 | ⚠️ 느려짐 |
+| 3 | 10,000명 | 84.5% | 29.1초 | ❌ 무너짐 |
+| 4 | 10,000명 (대기 줄 크기·한도 10배) | 77.8% | 25.3초 | ❌ 거의 그대로 |
+
+4단계처럼 숫자만 키워서는 거의 나아지지 않았습니다.
 
 <details>
-<summary>1. VU 100</summary>
+<summary>1단계 k6 원본 결과</summary>
 
 ```Text
   █ THRESHOLDS
@@ -391,7 +390,7 @@ docker exec -it pg-stresstest psql -U app -d stresstest -c "SELECT * FROM course
 </details>
 
 <details>
-<summary>2. VU 1,000 (10배)</summary>
+<summary>2단계 k6 원본 결과</summary>
 
 ```Text
   █ THRESHOLDS
@@ -425,7 +424,7 @@ docker exec -it pg-stresstest psql -U app -d stresstest -c "SELECT * FROM course
 </details>
 
 <details>
-<summary>3. VU 10,000 (100배)</summary>
+<summary>3단계 k6 원본 결과</summary>
 
 ```Text
   █ THRESHOLDS
@@ -459,7 +458,7 @@ docker exec -it pg-stresstest psql -U app -d stresstest -c "SELECT * FROM course
 </details>
 
 <details>
-<summary>4. VU 10,000, 큐 용량·동시 처리 수 10배</summary>
+<summary>4단계 k6 원본 결과</summary>
 
 ```Text
   █ THRESHOLDS
@@ -492,20 +491,21 @@ docker exec -it pg-stresstest psql -U app -d stresstest -c "SELECT * FROM course
 
 </details>
 
-## 트러블슈팅
+## 만들면서 부딪힌 문제
 
-- **H2 → 공유 PostgreSQL**: 서버마다 H2(인메모리 DB)를 쓰면 서버끼리 경합이 생기지 않습니다. Docker로 PostgreSQL을 띄워 서버 3대가 같은 DB를 보게 바꿨습니다.
-- **로드밸런서 응답 헤더 중복**: 로드밸런서가 서버 응답을 헤더째 그대로 다시 감싸 보내, k6에서 헤더가 두 번 붙은 응답을 모두 에러로 처리했습니다. `LoadBalancer.java`에서 `exchangeToMono`로 응답 본문만 꺼내 전달하도록 고쳤습니다.
-- **고정 한도의 한계 → 적응형 제어**: 처리 시간과 성공 여부로 동시 처리 한도를 늘리고 줄이도록 바꿔, 같은 시간에 더 많이 처리하고 실패율을 0%로 낮췄습니다.
+| 문제 | 원인 | 해결 |
+| :--- | :--- | :--- |
+| 서버끼리 충돌이 안 생김 | 서버마다 각자 메모리 DB(H2)를 써서 데이터를 공유하지 않음 | Docker로 PostgreSQL을 띄워 서버 3대가 같은 DB를 쓰게 함 |
+| k6가 모든 응답을 에러로 판단 | 로드밸런서가 서버 응답을 헤더째 다시 감싸 보내 헤더가 두 번 붙음 | `exchangeToMono`로 응답 내용만 꺼내 전달 |
+| 부하가 크면 실패가 쏟아짐 | 동시 처리 한도가 고정값이라 상황에 못 맞춤 | 처리 시간과 성공 여부를 보고 한도를 스스로 조절 |
 
-## 결론
+## 배운 점
 
-- 우선순위 큐를 수정해 서버에 과부하가 가지 않도록 한 결과, 최적화 전에는 실패가 발생하고 같은 시간 동안 훨씬 적게 처리했지만, 최적화 후에는 같은 시간에 더 많이 처리하면서 실패율도 크게 낮아졌습니다.
-- 서버의 역량이 우선순위 큐보다 더 중요하고, 그래서 수강신청·좌석 예매처럼 순간 접속자가 크게 뛰는 서비스는 서버를 여러 대 두어 부하를 나누거나, 큐로 동시에 들어올 수 있는 인원을 제한한다는 것을 알게 되었습니다.
-- 앞으로는 사용량이 늘어날 것을 예상해 서버를 미리 늘리는 확장(가상 머신, 오토스케일링 등)을 염두에 두고 설계하는 것이 좋아 보입니다.
-- 하나의 DB에 모든 요청이 몰리기보다, 강좌별로 DB를 나누는 등 DB 부하를 분산하면 더 많은 사용자가 쾌적하게 쓸 수 있을 것이라고 생각합니다.
-- 수정할 때마다 커밋을 남겨야 왜 이런 결과가 나왔는지 나중에 확실히 알 수 있다는 것을 느꼈습니다. 앞으로는 결과를 혼자 확인하는 데서 끝내지 않고, 수정 하나당 커밋 하나로 과정을 기록하려 합니다.
+- **숫자를 키우는 것보다 조절하는 게 중요했습니다.** 한도를 10배로 늘려도 거의 나아지지 않았지만, 상황에 맞춰 조절하게 바꾸자 같은 시간에 더 많이 처리하면서 실패는 0이 됐습니다.
+- **결국 서버가 감당할 수 있는 양이 핵심입니다.** 그래서 수강신청·티켓 예매처럼 순간 접속자가 폭증하는 서비스는 서버를 여러 대 두어 나누거나, 대기열로 들어오는 인원을 제한합니다.
+- **다음에 해 보고 싶은 것**: 사용량이 늘면 서버를 자동으로 늘리는 구조(오토스케일링), 강의별로 DB를 나눠 한 DB에 몰리는 부하를 줄이는 구조
+- **기록의 중요성**: 수정할 때마다 커밋을 남겨야 나중에 "왜 이런 결과가 나왔는지"를 알 수 있다는 걸 느꼈습니다. 앞으로는 수정 하나당 커밋 하나로 과정을 남기려 합니다.
 
 ## 라이선스
 
-이 프로젝트는 MIT 라이선스를 따릅니다.
+MIT
